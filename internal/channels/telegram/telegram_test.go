@@ -41,3 +41,32 @@ func TestTelegramHandleUpdateWithInlineButtons(t *testing.T) {
 		t.Fatalf("expected inline keyboard with tasks, got text=%q hasKeyboard=%v", gotText, hasKeyboard)
 	}
 }
+
+func TestTelegramMarkdownFallbackOn400(t *testing.T) {
+	attempts := 0
+	var lastParseMode any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		lastParseMode = body["parse_mode"]
+		if body["parse_mode"] != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"ok":false,"description":"Bad Request: can't parse entities"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	adapter := NewAdapter("fake-token", nil)
+	adapter.BaseURL = srv.URL
+
+	if err := adapter.Send(context.Background(), "222222222", "Broken _markdown_ [unclosed"); err != nil {
+		t.Fatalf("expected plain-text fallback to succeed, got %v", err)
+	}
+	if attempts != 2 || lastParseMode != nil {
+		t.Fatalf("expected 2 attempts with plain-text fallback, got attempts=%d lastParseMode=%v", attempts, lastParseMode)
+	}
+}

@@ -22,6 +22,7 @@ type AskResponse struct {
 	Reply          string
 	ConversationID string
 	Model          string
+	OutboxFiles    []string
 }
 
 // TaskInfo describes an automation/scheduled job exposed by an ops backend.

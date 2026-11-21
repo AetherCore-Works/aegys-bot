@@ -29,11 +29,12 @@ type ActionButton struct {
 
 // Response is returned by the Router and formatted by each channel adapter.
 type Response struct {
-	Allowed  bool           `json:"allowed"`
-	Path     string         `json:"path"` // "fast" | "ai" | "denied"
-	Role     string         `json:"role"`
-	Text     string         `json:"text"`
-	Buttons  []ActionButton `json:"buttons,omitempty"`
+	Allowed     bool           `json:"allowed"`
+	Path        string         `json:"path"` // "fast" | "ai" | "denied"
+	Role        string         `json:"role"`
+	Text        string         `json:"text"`
+	Buttons     []ActionButton `json:"buttons,omitempty"`
+	OutboxFiles []string       `json:"outbox_files,omitempty"`
 }
 
 // Router implements Aegys's Hybrid Routing architecture (Fast-Path vs AI-Path) with RBAC.
@@ -262,7 +263,18 @@ func (r *Router) handleAI(ctx context.Context, msg InboundMessage, role rbac.Rol
 	if reply == "" {
 		reply = "(empty response from AI backend)"
 	}
-	return Response{Allowed: true, Path: "ai", Role: role.String(), Text: reply}
+	return Response{
+		Allowed:     true,
+		Path:        "ai",
+		Role:        role.String(),
+		Text:        reply,
+		OutboxFiles: res.OutboxFiles,
+	}
+}
+
+// IsAllowed checks RBAC authorization without invoking any backend or mutating sessions.
+func (r *Router) IsAllowed(platform, userID string, isDM bool) bool {
+	return r.guard.RoleFor(platform, userID, isDM) != rbac.RoleDenied
 }
 
 func (r *Router) adminRequired(role rbac.Role, cmd string) Response {

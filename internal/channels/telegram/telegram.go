@@ -93,24 +93,42 @@ func (a *Adapter) sendWithButtons(ctx context.Context, chatID, text string, butt
 			payload["reply_markup"] = map[string]any{"inline_keyboard": rows}
 		}
 
-		raw, _ := json.Marshal(payload)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+		status, errBody, err := a.postSendMessage(ctx, endpoint, payload)
 		if err != nil {
 			return err
 		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := a.Client.Do(req)
-		if err != nil {
-			return err
+		if status == http.StatusBadRequest && payload["parse_mode"] != nil {
+			// Fallback to plain text if Telegram rejects unescaped Markdown entities (common in LLM code/identifiers).
+			delete(payload, "parse_mode")
+			status, errBody, err = a.postSendMessage(ctx, endpoint, payload)
+			if err != nil {
+				return err
+			}
 		}
-		if resp.StatusCode >= 300 {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			resp.Body.Close()
-			return fmt.Errorf("telegram sendMessage failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+		if status >= 300 {
+			return fmt.Errorf("telegram sendMessage failed (%d): %s", status, errBody)
 		}
-		resp.Body.Close()
 	}
 	return nil
+}
+
+func (a *Adapter) postSendMessage(ctx context.Context, endpoint string, payload map[string]any) (int, string, error) {
+	raw, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.Client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return resp.StatusCode, strings.TrimSpace(string(errBody)), nil
+	}
+	return resp.StatusCode, "", nil
 }
 
 func (a *Adapter) answerCallback(ctx context.Context, callbackID string) {

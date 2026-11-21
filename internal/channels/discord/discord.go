@@ -298,10 +298,11 @@ func (a *Adapter) handleMessageCreate(ctx context.Context, raw json.RawMessage) 
 
 func (a *Adapter) handleInteractionCreate(ctx context.Context, raw json.RawMessage) {
 	var ev struct {
-		ID      string `json:"id"`
-		Token   string `json:"token"`
-		GuildID string `json:"guild_id"`
-		Channel struct {
+		ID            string `json:"id"`
+		ApplicationID string `json:"application_id"`
+		Token         string `json:"token"`
+		GuildID       string `json:"guild_id"`
+		Channel       struct {
 			ID string `json:"id"`
 		} `json:"channel"`
 		Member *struct {
@@ -329,6 +330,27 @@ func (a *Adapter) handleInteractionCreate(ctx context.Context, raw json.RawMessa
 	} else if ev.Member != nil {
 		userID = ev.Member.User.ID
 	}
+	isDM := ev.GuildID == ""
+	callbackURL := fmt.Sprintf("%s/interactions/%s/%s/callback", a.APIBase, ev.ID, ev.Token)
+
+	// Reject unauthorized interactions immediately with an ephemeral response (within Discord's 3s window).
+	if !a.Router.IsAllowed("discord", userID, isDM) {
+		_ = a.postJSON(ctx, http.MethodPost, callbackURL, map[string]any{
+			"type": 4,
+			"data": map[string]any{
+				"content": "Access denied.",
+				"flags":   64, // Ephemeral
+			},
+		})
+		return
+	}
+
+	// Acknowledge immediately with DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE (type 5) to avoid Discord's 3s timeout.
+	if err := a.postJSON(ctx, http.MethodPost, callbackURL, map[string]any{"type": 5}); err != nil {
+		log.Printf("[discord] defer interaction failed: %v", err)
+		return
+	}
+
 	cmd := "/" + ev.Data.Name
 	if len(ev.Data.Options) > 0 {
 		cmd += " " + fmt.Sprint(ev.Data.Options[0].Value)
@@ -339,24 +361,60 @@ func (a *Adapter) handleInteractionCreate(ctx context.Context, raw json.RawMessa
 		UserID:   userID,
 		ChatID:   ev.Channel.ID,
 		Text:     cmd,
-		IsDM:     ev.GuildID == "",
+		IsDM:     isDM,
 	})
 
-	reply := res.Text
-	if len(reply) > 1900 {
-		reply = reply[:1897] + "..."
+	reply := strings.TrimSpace(res.Text)
+	if reply == "" {
+		reply = "(empty response)"
 	}
-	cb, _ := json.Marshal(map[string]any{
-		"type": 4,
-		"data": map[string]any{"content": reply},
-	})
-	endpoint := fmt.Sprintf("%s/interactions/%s/%s/callback", a.APIBase, ev.ID, ev.Token)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(cb))
-	if err != nil {
+
+	appID := ev.ApplicationID
+	if appID == "" {
+		appID = a.AppID
+	}
+	if appID == "" {
+		if ev.Channel.ID != "" {
+			_ = a.SendChannelMessage(ctx, ev.Channel.ID, reply)
+		}
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if resp, err := a.Client.Do(req); err == nil {
-		resp.Body.Close()
+
+	chunks := format.SplitChunks(reply, 1900)
+	editURL := fmt.Sprintf("%s/webhooks/%s/%s/messages/@original", a.APIBase, appID, ev.Token)
+	if err := a.postJSON(ctx, http.MethodPatch, editURL, map[string]any{"content": chunks[0]}); err != nil {
+		log.Printf("[discord] edit interaction response failed: %v", err)
+		return
 	}
+	if len(chunks) > 1 {
+		followupURL := fmt.Sprintf("%s/webhooks/%s/%s", a.APIBase, appID, ev.Token)
+		for _, chunk := range chunks[1:] {
+			if err := a.postJSON(ctx, http.MethodPost, followupURL, map[string]any{"content": chunk}); err != nil {
+				log.Printf("[discord] followup message failed: %v", err)
+				return
+			}
+		}
+	}
+}
+
+func (a *Adapter) postJSON(ctx context.Context, method, endpoint string, payload any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("discord %s %s failed (%d): %s", method, endpoint, resp.StatusCode, strings.TrimSpace(string(errBody)))
+	}
+	return nil
 }

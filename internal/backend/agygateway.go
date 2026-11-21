@@ -1,45 +1,51 @@
 package backend
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 // AgyGateway connects Aegys Bot to AetherCore-Works/agy-mobile over HTTP.
 type AgyGateway struct {
-	BaseURL string
-	Secret  string
-	Client  *http.Client
+	BaseURL          string
+	Secret           string
+	Client           *http.Client
+	StreamClient     *http.Client
+	PromptTimeoutSec int
 }
 
 func NewAgyGateway(baseURL, secret string) *AgyGateway {
 	return &AgyGateway{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		Secret:  secret,
-		Client:  &http.Client{Timeout: 120 * time.Second},
+		BaseURL:          strings.TrimRight(baseURL, "/"),
+		Secret:           secret,
+		Client:           &http.Client{Timeout: 75 * time.Second},
+		StreamClient:     &http.Client{Timeout: 10 * time.Minute},
+		PromptTimeoutSec: 55,
 	}
 }
 
 func (g *AgyGateway) Name() string { return "agy-gateway" }
 
-func (g *AgyGateway) doJSON(ctx context.Context, method, path string, payload any, out any) error {
+func (g *AgyGateway) doJSON(ctx context.Context, method, path string, payload any, out any) (int, error) {
 	var body io.Reader
 	if payload != nil {
 		raw, err := json.Marshal(payload)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		body = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, g.BaseURL+path, body)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -50,44 +56,178 @@ func (g *AgyGateway) doJSON(ctx context.Context, method, path string, payload an
 
 	resp, err := g.Client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("agy-gateway %s %s failed (%d): %s", method, path, resp.StatusCode, strings.TrimSpace(string(msg)))
+		return resp.StatusCode, fmt.Errorf("agy-gateway %s %s failed (%d): %s", method, path, resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return resp.StatusCode, err
+		}
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 func (g *AgyGateway) Ask(ctx context.Context, req AskRequest) (AskResponse, error) {
 	var res struct {
-		Reply  string `json:"reply"`
-		ConvID string `json:"conv_id"`
-		Model  string `json:"model"`
+		OK             *bool    `json:"ok"`
+		JobID          string   `json:"job_id"`
+		ConversationID string   `json:"conversation_id"`
+		ConvID         string   `json:"conv_id"`
+		Status         string   `json:"status"`
+		Pending        bool     `json:"pending"`
+		Reply          string   `json:"reply"`
+		Model          string   `json:"model"`
+		OutboxFiles    []string `json:"outbox_files"`
+		Error          string   `json:"error"`
+	}
+	timeoutSec := g.PromptTimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = 55
 	}
 	payload := map[string]any{
-		"prompt":  req.Prompt,
-		"conv_id": req.ConversationID,
-		"wait":    true,
+		"prompt":      req.Prompt,
+		"wait":        true,
+		"timeout_sec": timeoutSec,
 	}
-	if err := g.doJSON(ctx, http.MethodPost, "/api/webhook/prompt", payload, &res); err != nil {
+	if cid := strings.TrimSpace(req.ConversationID); cid != "" {
+		payload["conversation_id"] = cid
+	}
+	statusCode, err := g.doJSON(ctx, http.MethodPost, "/api/webhook/prompt", payload, &res)
+	if err != nil {
 		return AskResponse{}, err
+	}
+
+	if statusCode == http.StatusAccepted || (res.Pending && res.JobID != "") {
+		if strings.TrimSpace(res.JobID) == "" {
+			return AskResponse{}, fmt.Errorf("agy-gateway returned 202 pending without job_id")
+		}
+		return g.followJobEvents(ctx, res.JobID, req.ConversationID)
+	}
+
+	if res.Error != "" {
+		return AskResponse{}, fmt.Errorf("agy-gateway job error: %s", res.Error)
+	}
+	if res.Status == "error" || res.Status == "cancelled" {
+		return AskResponse{}, fmt.Errorf("agy-gateway job ended with status %q", res.Status)
+	}
+
+	convID := res.ConversationID
+	if convID == "" {
+		convID = res.ConvID
 	}
 	return AskResponse{
 		Reply:          res.Reply,
-		ConversationID: res.ConvID,
+		ConversationID: convID,
 		Model:          res.Model,
+		OutboxFiles:    res.OutboxFiles,
 	}, nil
+}
+
+func (g *AgyGateway) followJobEvents(ctx context.Context, jobID, fallbackConvID string) (AskResponse, error) {
+	endpoint := g.BaseURL + "/api/jobs/" + url.PathEscape(jobID) + "/events?after=0"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return AskResponse{}, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	if g.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+g.Secret)
+	}
+
+	client := g.StreamClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Minute}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return AskResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return AskResponse{}, fmt.Errorf("agy-gateway stream %s failed (%d): %s", jobID, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+
+	var deltaBuf strings.Builder
+	out := AskResponse{ConversationID: fallbackConvID}
+	var jobErr string
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		raw := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if raw == "" {
+			continue
+		}
+		if raw == "[DONE]" {
+			break
+		}
+
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			continue
+		}
+		evType, _ := ev["type"].(string)
+
+		if t, ok := ev["text"].(string); ok && t != "" && (evType == "" || evType == "delta") {
+			deltaBuf.WriteString(t)
+		}
+		if r, ok := ev["response"].(string); ok && strings.TrimSpace(r) != "" {
+			out.Reply = r
+		}
+		if cid, ok := ev["conversation_id"].(string); ok && cid != "" {
+			out.ConversationID = cid
+		}
+		if m, ok := ev["model"].(string); ok && m != "" {
+			out.Model = m
+		}
+		if files, ok := ev["outbox_files"].([]any); ok {
+			out.OutboxFiles = out.OutboxFiles[:0]
+			for _, f := range files {
+				if s, ok := f.(string); ok && s != "" {
+					out.OutboxFiles = append(out.OutboxFiles, s)
+				}
+			}
+		}
+		if evType == "error" {
+			if msg, ok := ev["message"].(string); ok && msg != "" {
+				jobErr = msg
+			} else if msg, ok := ev["error"].(string); ok && msg != "" {
+				jobErr = msg
+			} else {
+				jobErr = "remote job failed"
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return AskResponse{}, fmt.Errorf("agy-gateway event stream error: %w", err)
+	}
+	if strings.TrimSpace(out.Reply) == "" {
+		out.Reply = deltaBuf.String()
+	}
+	if jobErr != "" && strings.TrimSpace(out.Reply) == "" {
+		return AskResponse{}, fmt.Errorf("agy-gateway job error: %s", jobErr)
+	}
+	return out, nil
 }
 
 func (g *AgyGateway) Health(ctx context.Context) (string, error) {
 	var res map[string]any
-	if err := g.doJSON(ctx, http.MethodGet, "/api/health", nil, &res); err != nil {
+	if _, err := g.doJSON(ctx, http.MethodGet, "/api/health", nil, &res); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("agy-gateway reachable (%s)", g.BaseURL), nil
@@ -102,7 +242,7 @@ func (g *AgyGateway) ListTasks(ctx context.Context) ([]TaskInfo, error) {
 			Enabled  bool   `json:"enabled"`
 		} `json:"automations"`
 	}
-	if err := g.doJSON(ctx, http.MethodGet, "/api/automations", nil, &res); err != nil {
+	if _, err := g.doJSON(ctx, http.MethodGet, "/api/automations", nil, &res); err != nil {
 		return nil, err
 	}
 	out := make([]TaskInfo, 0, len(res.Automations))
@@ -119,7 +259,7 @@ func (g *AgyGateway) ListTasks(ctx context.Context) ([]TaskInfo, error) {
 
 func (g *AgyGateway) RunTask(ctx context.Context, taskID string) (string, error) {
 	var res map[string]any
-	if err := g.doJSON(ctx, http.MethodPost, "/api/automations/"+taskID+"/run", nil, &res); err != nil {
+	if _, err := g.doJSON(ctx, http.MethodPost, "/api/automations/"+url.PathEscape(taskID)+"/run", nil, &res); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("Task `%s` triggered on agy-gateway.", taskID), nil
@@ -127,7 +267,7 @@ func (g *AgyGateway) RunTask(ctx context.Context, taskID string) (string, error)
 
 func (g *AgyGateway) WakeHost(ctx context.Context) (string, error) {
 	var res map[string]any
-	if err := g.doJSON(ctx, http.MethodPost, "/api/wol", nil, &res); err != nil {
+	if _, err := g.doJSON(ctx, http.MethodPost, "/api/wol", nil, &res); err != nil {
 		return "", err
 	}
 	return "Wake-on-LAN magic packet dispatched via agy-gateway.", nil

@@ -1,0 +1,31 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Build artifacts & binaries
+/bin/
+/dist/
+/aegys
+/aegys.exe
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Runtime data & local overrides
+/data/
+config/commands.local.json
+*.db
+*.sqlite
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

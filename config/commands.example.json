@@ -1,0 +1,22 @@
+{
+  "commands": [
+    {
+      "name": "/briefing",
+      "description": "Generate a concise daily operations briefing",
+      "prompt_template": "Summarize the current system status, active tasks, and priorities concisely. {{input}}",
+      "admin_only": true
+    },
+    {
+      "name": "/summarize",
+      "description": "Summarize text, logs, or technical notes",
+      "prompt_template": "Summarize the key points, risks, and action items from the following input: {{input}}",
+      "admin_only": false
+    },
+    {
+      "name": "/explain",
+      "description": "Explain a technical concept or error message clearly",
+      "prompt_template": "Explain the root cause and recommended fix clearly and concisely: {{input}}",
+      "admin_only": false
+    }
+  ]
+}

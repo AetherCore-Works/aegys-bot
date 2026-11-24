@@ -144,3 +144,50 @@ func TestOllamaAndOpenAIBackends(t *testing.T) {
 		t.Fatalf("openai failed: res=%+v err=%v", res, err)
 	}
 }
+
+func TestAgyGatewayEvolutionEndpoints(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/feedback":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["rating"] != "up" || body["conversation_id"] != "conv-1" {
+				t.Fatalf("unexpected feedback payload: %+v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "kind": "feedback_up"})
+		case "/api/evolution/report":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"enabled": true,
+				"proposals": []map[string]any{
+					{"id": "prop-1", "kind": "prompt_rule", "title": "Prefer concise diffs", "status": "pending"},
+					{"id": "prop-2", "kind": "slash_command", "title": "Old", "status": "approved"},
+				},
+			})
+		case "/api/evolution/proposals/prop-1/approve":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case "/api/evolution/proposals/prop-1/reject":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	gw := NewAgyGateway(srv.URL, "tok")
+	kind, err := gw.SubmitFeedback(context.Background(), "conv-1", "up", "")
+	if err != nil || kind != "feedback_up" {
+		t.Fatalf("SubmitFeedback failed: kind=%q err=%v", kind, err)
+	}
+	rep, err := gw.EvolutionReport(context.Background())
+	if err != nil || !rep.Enabled || rep.PendingCount != 1 || len(rep.Proposals) != 2 {
+		t.Fatalf("EvolutionReport failed: rep=%+v err=%v", rep, err)
+	}
+	msg, err := gw.DecideProposal(context.Background(), "prop-1", true)
+	if err != nil || !strings.Contains(msg, "approved") {
+		t.Fatalf("DecideProposal approve failed: msg=%q err=%v", msg, err)
+	}
+	msg, err = gw.DecideProposal(context.Background(), "prop-1", false)
+	if err != nil || !strings.Contains(msg, "rejected") {
+		t.Fatalf("DecideProposal reject failed: msg=%q err=%v", msg, err)
+	}
+}

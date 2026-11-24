@@ -272,3 +272,62 @@ func (g *AgyGateway) WakeHost(ctx context.Context) (string, error) {
 	}
 	return "Wake-on-LAN magic packet dispatched via agy-gateway.", nil
 }
+
+// SubmitFeedback records user thumbs-up/down or correction notes in agy-gateway's evolution telemetry.
+func (g *AgyGateway) SubmitFeedback(ctx context.Context, convID, rating, correction string) (string, error) {
+	payload := map[string]any{
+		"conversation_id": strings.TrimSpace(convID),
+		"rating":          strings.ToLower(strings.TrimSpace(rating)),
+		"correction":      strings.TrimSpace(correction),
+	}
+	var res struct {
+		OK   bool   `json:"ok"`
+		Kind string `json:"kind"`
+	}
+	if _, err := g.doJSON(ctx, http.MethodPost, "/api/feedback", payload, &res); err != nil {
+		return "", err
+	}
+	if res.Kind == "" {
+		return "feedback", nil
+	}
+	return res.Kind, nil
+}
+
+// EvolutionReport fetches the evolution loop status and proposals from agy-gateway.
+func (g *AgyGateway) EvolutionReport(ctx context.Context) (EvolutionReportSummary, error) {
+	var res struct {
+		Enabled   bool                       `json:"enabled"`
+		Proposals []EvolutionProposalSummary `json:"proposals"`
+	}
+	if _, err := g.doJSON(ctx, http.MethodGet, "/api/evolution/report", nil, &res); err != nil {
+		return EvolutionReportSummary{}, err
+	}
+	pending := 0
+	for _, p := range res.Proposals {
+		if strings.EqualFold(strings.TrimSpace(p.Status), "pending") {
+			pending++
+		}
+	}
+	return EvolutionReportSummary{
+		Enabled:      res.Enabled,
+		PendingCount: pending,
+		Proposals:    res.Proposals,
+	}, nil
+}
+
+// DecideProposal approves or rejects an evolution proposal on agy-gateway.
+func (g *AgyGateway) DecideProposal(ctx context.Context, proposalID string, approve bool) (string, error) {
+	action := "reject"
+	if approve {
+		action = "approve"
+	}
+	var res map[string]any
+	path := "/api/evolution/proposals/" + url.PathEscape(strings.TrimSpace(proposalID)) + "/" + action
+	if _, err := g.doJSON(ctx, http.MethodPost, path, nil, &res); err != nil {
+		return "", err
+	}
+	if approve {
+		return fmt.Sprintf("Proposal `%s` approved on agy-gateway.", proposalID), nil
+	}
+	return fmt.Sprintf("Proposal `%s` rejected on agy-gateway.", proposalID), nil
+}

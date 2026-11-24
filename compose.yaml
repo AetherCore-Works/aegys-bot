@@ -6,6 +6,8 @@ services:
     user: "1000:1000"
     ports:
       - "${AEGYS_PORT:-8090}:8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:

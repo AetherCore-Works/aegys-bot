@@ -131,6 +131,10 @@ func (r *Router) Handle(ctx context.Context, msg InboundMessage) Response {
 			return r.handleRunTask(ctx, role, arg)
 		case "/wol":
 			return r.handleWakeHost(ctx, role)
+		case "/feedback":
+			return r.handleFeedback(ctx, msg, role, arg)
+		case "/evolution":
+			return r.handleEvolution(ctx, role, arg)
 		case "/ask":
 			if arg == "" {
 				return Response{Allowed: true, Path: "fast", Role: role.String(), Text: "Usage: `/ask <your prompt>`"}
@@ -286,6 +290,100 @@ func (r *Router) adminRequired(role rbac.Role, cmd string) Response {
 	}
 }
 
+func (r *Router) handleFeedback(ctx context.Context, msg InboundMessage, role rbac.Role, arg string) Response {
+	evo, ok := r.ai.(backend.EvolutionBackend)
+	if !ok {
+		return Response{
+			Allowed: true,
+			Path:    "fast",
+			Role:    role.String(),
+			Text:    fmt.Sprintf("Active backend `%s` does not support evolution feedback.", r.ai.Name()),
+		}
+	}
+	raw := strings.TrimSpace(arg)
+	if raw == "" {
+		return Response{
+			Allowed: true,
+			Path:    "fast",
+			Role:    role.String(),
+			Text:    "Usage: `/feedback up|down|<correction text>`",
+		}
+	}
+	rating := ""
+	correction := ""
+	switch strings.ToLower(raw) {
+	case "up", "+1", "👍":
+		rating = "up"
+	case "down", "-1", "👎":
+		rating = "down"
+	default:
+		correction = raw
+	}
+	convID := r.getSession(msg.Platform, msg.ChatID)
+	kind, err := evo.SubmitFeedback(ctx, convID, rating, correction)
+	if err != nil {
+		return Response{Allowed: true, Path: "fast", Role: role.String(), Text: fmt.Sprintf("Failed to submit feedback: `%v`", err)}
+	}
+	return Response{
+		Allowed: true,
+		Path:    "fast",
+		Role:    role.String(),
+		Text:    fmt.Sprintf("Feedback recorded (`%s`).", kind),
+	}
+}
+
+func (r *Router) handleEvolution(ctx context.Context, role rbac.Role, arg string) Response {
+	if !rbac.CanExecute(role, rbac.RoleAdmin) {
+		return r.adminRequired(role, "/evolution")
+	}
+	evo, ok := r.ai.(backend.EvolutionBackend)
+	if !ok {
+		return Response{
+			Allowed: true,
+			Path:    "fast",
+			Role:    role.String(),
+			Text:    fmt.Sprintf("Active backend `%s` does not support the evolution loop.", r.ai.Name()),
+		}
+	}
+
+	fields := strings.Fields(strings.TrimSpace(arg))
+	if len(fields) >= 2 {
+		sub := strings.ToLower(fields[0])
+		id := strings.TrimSpace(fields[1])
+		if sub == "approve" || sub == "reject" {
+			msg, err := evo.DecideProposal(ctx, id, sub == "approve")
+			if err != nil {
+				return Response{Allowed: true, Path: "fast", Role: role.String(), Text: fmt.Sprintf("Evolution action failed: `%v`", err)}
+			}
+			return Response{Allowed: true, Path: "fast", Role: role.String(), Text: msg}
+		}
+	}
+
+	report, err := evo.EvolutionReport(ctx)
+	if err != nil {
+		return Response{Allowed: true, Path: "fast", Role: role.String(), Text: fmt.Sprintf("Failed to fetch evolution report: `%v`", err)}
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("## Evolution Loop (enabled: `%v`, pending: `%d`)\n", report.Enabled, report.PendingCount))
+	shown := 0
+	for _, p := range report.Proposals {
+		if !strings.EqualFold(p.Status, "pending") {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("- `%s` [%s]: %s\n", p.ID, p.Kind, p.Title))
+		shown++
+		if shown >= 10 {
+			break
+		}
+	}
+	if shown == 0 {
+		b.WriteString("_No pending proposals._")
+	} else {
+		b.WriteString("\nUse `/evolution approve <id>` or `/evolution reject <id>`.")
+	}
+	return Response{Allowed: true, Path: "fast", Role: role.String(), Text: strings.TrimSpace(b.String())}
+}
+
 func (r *Router) helpText(role rbac.Role) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("## %s Commands\n", r.botName))
@@ -293,11 +391,13 @@ func (r *Router) helpText(role rbac.Role) string {
 	b.WriteString("- `/ping` — Check bot latency and uptime\n")
 	b.WriteString("- `/whoami` — Show your platform ID and RBAC role\n")
 	b.WriteString("- `/reset` — Start a new AI conversation session\n")
+	b.WriteString("- `/feedback <up|down|note>` — Send feedback to evolution telemetry\n")
 	if rbac.CanExecute(role, rbac.RoleAdmin) {
 		b.WriteString("- `/status` — Backend & host health check *(admin)*\n")
 		b.WriteString("- `/tasks` — List scheduled backend automations *(admin)*\n")
 		b.WriteString("- `/run <id>` — Trigger an automation immediately *(admin)*\n")
 		b.WriteString("- `/wol` — Send Wake-on-LAN packet *(admin)*\n")
+		b.WriteString("- `/evolution [approve|reject <id>]` — Manage evolution proposals *(admin)*\n")
 	}
 	b.WriteString("\n**AI-Path:**\n")
 	b.WriteString("- `/ask <prompt>` or any plain text message — Route to `" + r.ai.Name() + "`\n")
